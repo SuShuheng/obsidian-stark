@@ -1,0 +1,364 @@
+import type { ContentBlock, FileAttachment, ImageAttachment, McpServer, Provider, StreamOptions, TokenUsage, UnifiedMessage, UnifiedResponse } from "../types";
+import { ProviderError, StreamCutError } from "./errors";
+import { RequestNotSent, StreamDropped, streamSSE, type StreamResult } from "./stream";
+import { serializeRequest } from "./request-budget";
+import { isRecord } from "../json";
+import { withoutOldToolImages } from "../agent/history";
+import { afterCompaction } from "../agent/compaction";
+import { fileAsText, isSentAsFile } from "../files/attachments";
+import { openaiServerCalls, withServerCalls, withoutGoneServerCalls } from "./mcp";
+
+/** A failure the stream reported (`error`, `response.failed`). */
+export interface ResponsesFailure {
+  message: string;
+  code?: string;
+}
+
+/** The adapter's errors for an HTTP error answer and for a failure inside the stream. */
+export interface ResponsesErrors {
+  http(response: StreamResult): Error;
+  stream(failure: ResponsesFailure): Error;
+}
+
+/**
+ * Sends a streamed Responses request (OpenAI, and the ChatGPT account's
+ * Codex route with its own headers); returns the completed response as the
+ * non-streamed API would. `name` names the provider in the error for a
+ * stream that ends too early.
+ */
+export async function sendResponsesRequest(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  stream: StreamOptions,
+  name: string,
+  errors: ResponsesErrors,
+): Promise<Record<string, unknown>> {
+  const collected = collectResponsesStream(
+    stream.onTextDelta,
+    stream.onServerTool,
+    stream.onReasoningSummaryDelta,
+  );
+  // The final size check (`serializeRequest`) runs before anything is sent.
+  const requestBody = serializeRequest(body);
+  const remoteEnabled = Array.isArray(body.tools) && body.tools.some(tool => isRecord(tool) && tool.type === "mcp");
+  const reasoning = isRecord(body.reasoning) ? body.reasoning : undefined;
+  const streamOptions = isRecord(body.stream_options) ? body.stream_options : undefined;
+  const onStreamDiagnostics = stream.onStreamDiagnostics;
+  let response: StreamResult;
+  try {
+    response = await streamSSE(url, {
+      headers,
+      body: requestBody,
+      noFallback: remoteEnabled,
+      proxy: stream.proxy,
+    }, collected.onEvent, stream.signal, onStreamDiagnostics ? (diagnostics) => onStreamDiagnostics({
+      ...diagnostics,
+      ...(typeof reasoning?.effort === "string" ? { requestedReasoningEffort: reasoning.effort } : {}),
+      ...(typeof reasoning?.summary === "string" ? { requestedReasoningSummary: reasoning.summary } : {}),
+      ...(typeof streamOptions?.reasoning_summary_delivery === "string"
+        ? { requestSummaryDelivery: streamOptions.reasoning_summary_delivery }
+        : {}),
+      ...(typeof headers.originator === "string" ? { requestOriginator: headers.originator } : {}),
+    }) : undefined);
+  } catch (error) {
+    if (error instanceof RequestNotSent && !collected.serverTool()) throw error;
+    if (collected.serverTool() || remoteEnabled) return collected.remoteFailure(error instanceof Error ? error.message : String(error));
+    if (error instanceof StreamDropped) throw new StreamCutError(name, collected.serverTool());
+    throw error;
+  }
+  if (response.status < 200 || response.status >= 300) throw errors.http(response);
+  const { data, failure } = collected.finish();
+  if (failure) {
+    if (collected.serverTool()) return collected.remoteFailure(failure.message, failure.code);
+    throw errors.stream(failure);
+  }
+  if (!data) {
+    if (collected.serverTool() || remoteEnabled) return collected.remoteFailure(`${name} stream ended before the answer was complete.`);
+    throw new StreamCutError(name);
+  }
+  return data;
+}
+
+/** Encode both fresh input and restored history without losing tool pairs. */
+export function buildResponsesInput(
+  messages: UnifiedMessage[],
+  provider: Extract<Provider, "openai" | "chatgpt-oauth">,
+  model?: string,
+  identity?: string,
+  /** The MCP servers of this request; calls of others aren't replayed. */
+  servers: McpServer[] = [],
+): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  const replayable = (message: UnifiedMessage) => message.role === "assistant" && message.replay?.provider === provider &&
+    (!model || !message.replay.model || message.replay.model === model) && (!identity || !message.replay.identity || message.replay.identity === identity);
+  // After a compaction, from its message on.
+  for (const message of withoutOldToolImages(afterCompaction(messages, replayable))) {
+    if (replayable(message) && message.replay) {
+      // Items before the latest compaction item are covered by it.
+      const replayed = withoutGoneServerCalls(message.replay.items, servers, message.replay.mcpServers);
+      const last = replayed.map((item) => item.type).lastIndexOf("compaction");
+      if (replayed.length) { items.push(...(last > 0 ? replayed.slice(last) : replayed)); continue; }
+
+    }
+    const content: Record<string, unknown>[] = [];
+    const flush = () => {
+      if (content.length) {
+        items.push({ type: "message", role: message.role, content: content.splice(0) });
+      }
+    };
+    const blocks: ContentBlock[] = typeof message.content === "string"
+      ? [{ type: "text", text: message.content }]
+      : message.content;
+    for (const block of blocks) {
+      if (block.type === "text" && block.text) {
+        content.push(message.role === "assistant"
+          ? { type: "output_text", text: block.text, annotations: [] }
+          : { type: "input_text", text: block.text });
+      } else if (block.type === "image" && block.image && message.role === "user") {
+        content.push(inputImage(block.image));
+      } else if (block.type === "file" && block.file && message.role === "user") {
+        content.push(inputFile(block.file));
+      } else if (block.type === "tool_use" && block.id && block.name) {
+        flush();
+        items.push({ type: "function_call", call_id: block.id, name: block.name, arguments: JSON.stringify(block.input ?? {}) });
+      } else if (block.type === "tool_result" && block.tool_use_id) {
+        flush();
+        items.push({ type: "function_call_output", call_id: block.tool_use_id, output: functionOutput(block) });
+      }
+    }
+    flush();
+  }
+  return items;
+}
+
+/**
+ * A tool result's `output`. With images or files it is a content array: the
+ * Responses API allows `output` to be a string or a list of `input_text`,
+ * `input_image` and `input_file` items (function_call_output in the API
+ * reference). The ChatGPT route takes the same request format, so both
+ * providers get the image or file inside the result rather than in an
+ * extra user message.
+ */
+function functionOutput(block: ContentBlock): string | Record<string, unknown>[] {
+  const text = block.content ?? "";
+  if (!block.images?.length && !block.files?.length) return text;
+  return [
+    { type: "input_text", text: text || "(attached)" },
+    ...(block.images ?? []).map(inputImage),
+    ...(block.files ?? []).map(inputFile),
+  ];
+}
+
+function inputImage(image: ImageAttachment): Record<string, unknown> {
+  return { type: "input_image", image_url: `data:${image.mediaType};base64,${image.data}`, detail: "auto" };
+}
+
+/**
+ * A file: PDF and Office files as `input_file` with inline base64 data (the
+ * model reads them itself, PDFs with their page images), text files as text.
+ */
+function inputFile(file: FileAttachment): Record<string, unknown> {
+  if (isSentAsFile(file)) {
+    return { type: "input_file", filename: file.fileName, file_data: `data:${file.mediaType};base64,${file.data}` };
+  }
+  return { type: "input_text", text: fileAsText(file) };
+}
+
+/** Preserve native reasoning/search/refusal items even when they have no UI block. */
+export function fromResponsesOutput(
+  data: Record<string, unknown>,
+  provider: Extract<Provider, "openai" | "chatgpt-oauth">,
+  model?: string,
+  identity?: string,
+): UnifiedResponse {
+  const output = Array.isArray(data.output) ? data.output.filter(isRecord) : [];
+  const failed = data.status === "failed" || !!data.error;
+  const content: ContentBlock[] = [];
+  if (failed && data.mcpEffectsPossible === true && !output.some(item => item.type === "mcp_call")) {
+    content.push({ type: "text", text: "Remote MCP request outcome unknown. Check the external service before repeating this request." });
+  }
+  for (const item of output) {
+    if (item.type === "message" && Array.isArray(item.content)) {
+      for (const part of item.content.filter(isRecord)) {
+        if (part.type === "output_text" && typeof part.text === "string") {
+          content.push({ type: "text", text: withoutCitationMarkers(part.text) });
+        } else if (part.type === "refusal" && typeof part.refusal === "string") {
+          content.push({ type: "text", text: part.refusal });
+        }
+      }
+    } else if (item.type === "function_call" && data.status !== "incomplete" && !failed) {
+      if (typeof item.call_id !== "string" || typeof item.name !== "string") {
+        throw new Error("Response contained an invalid tool call.");
+      }
+      const raw = typeof item.arguments === "string" ? item.arguments : "";
+      let input: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        input = isRecord(parsed) ? parsed : { _raw: raw };
+      } catch {
+        input = { _raw: raw };
+      }
+      content.push({ type: "tool_use", id: item.call_id, name: item.name, input });
+    }
+  }
+  const usage = isRecord(data.usage) ? data.usage : undefined;
+  const result: UnifiedResponse = {
+    content,
+    replay: { provider, model, identity, items: output },
+    stopReason: data.status === "incomplete" ? "max_tokens" : content.some(block => block.type === "tool_use") ? "tool_use" : "end_turn",
+    usage: usage ? responsesUsage(usage) : undefined,
+    // Tools OpenAI called on MCP servers; their items stay in the replay as sent.
+    ...withServerCalls(openaiServerCalls(output)),
+    // Server-side compaction: its item is encrypted, so no readable summary.
+    ...(output.some((item) => item.type === "compaction") ? { compaction: {} } : {}),
+  };
+  if (failed) {
+    const error = isRecord(data.error) ? data.error : {};
+    const remoteEffectsPossible = !!result.serverCalls?.length || data.mcpEffectsPossible === true;
+    // Keep receipts even though the error still ends the turn. The dispatcher
+    // must not repeat a request that may have changed an external service.
+    throw new ProviderError((typeof error.message === "string" ? error.message : "Response failed.") +
+      (remoteEffectsPossible ? " Remote MCP tools may already have run; check their results before retrying." : ""), 0,
+      typeof error.code === "string" ? error.code : undefined, undefined, remoteEffectsPossible, remoteEffectsPossible ? result : undefined);
+  }
+  return result;
+}
+
+/**
+ * Server-side compaction: the server compacts when a request's context
+ * crosses `threshold` and returns an encrypted compaction item.
+ */
+export function compactionParameter(threshold: number | undefined): Record<string, unknown> {
+  return threshold ? { context_management: [{ type: "compaction", compact_threshold: threshold }] } : {};
+}
+
+/** Responses API usage: `input_tokens` includes the cached ones (`input_tokens_details.cached_tokens`). */
+function responsesUsage(usage: Record<string, unknown>): TokenUsage {
+  const details = isRecord(usage.input_tokens_details) ? usage.input_tokens_details : {};
+  const cached = numberValue(details.cached_tokens);
+  return {
+    inputTokens: numberValue(usage.input_tokens),
+    outputTokens: numberValue(usage.output_tokens),
+    ...(cached ? { cachedInputTokens: cached } : {}),
+  };
+
+}
+
+/**
+ * Citation markers some models write into the text after a web search
+ * (seen on the ChatGPT route: "citeturn0search0" between private-use
+ * characters, a reference to a search result) instead of `annotations`.
+ * They are left out of the shown text; the replay items keep them as sent.
+ */
+const CITATION_MARKER = / ?\uE200[^\uE201]*\uE201/g;
+const CITATION_CHARACTERS = /[\uE200-\uE202]/g;
+
+export function withoutCitationMarkers(text: string): string {
+  return text.replace(CITATION_MARKER, "").replace(CITATION_CHARACTERS, "");
+}
+
+/**
+ * Collects a streamed Responses answer (`stream: true`). Text deltas go to
+ * `onTextDelta` as they arrive. The response is rebuilt from the
+ * `response.output_item.done` items (messages, tool calls, reasoning,
+ * search and MCP items alike), because `response.completed` may carry an
+ * empty `output` (always on the Codex route with `store: false`); the
+ * terminal event gives id, status and usage. `finish()` returns the same
+ * object the non-streamed API returns, or the failure the stream reported.
+ */
+function collectResponsesStream(
+  onTextDelta?: (text: string) => void,
+  onServerTool?: () => void,
+  onReasoningSummaryDelta?: (text: string) => void,
+): {
+  onEvent: (event: Record<string, unknown>) => void;
+  finish: () => { data?: Record<string, unknown>; failure?: ResponsesFailure };
+  /** An MCP call started in this answer. */
+  serverTool: () => boolean;
+  remoteFailure: (message: string, code?: string) => Record<string, unknown>;
+} {
+  let serverTool = false;
+  const items = new Map<string | number, Record<string, unknown>>();
+  let completed: Record<string, unknown> | undefined;
+  let failure: ResponsesFailure | undefined;
+  let reasoningSummaryText = "";
+  const emitReasoningSummary = (text: string): void => {
+    if (!text) return;
+    reasoningSummaryText += text;
+    onReasoningSummaryDelta?.(text);
+  };
+  return {
+    onEvent: (event) => {
+      const type = event.type;
+      if ((type === "response.output_item.added" || type === "response.output_item.done") &&
+        isRecord(event.item) && event.item.type === "mcp_call" && !serverTool) {
+        serverTool = true;
+        onServerTool?.();
+      }
+      // A call that started without a result still records possible effects.
+      if (type === "response.output_item.added" && isRecord(event.item) && event.item.type === "mcp_call") {
+        items.set(typeof event.output_index === "number" ? event.output_index : String(event.item.id), { ...event.item, status: "in_progress" });
+      }
+      if (type === "response.output_text.delta") {
+        // The markers' characters go; their words are dropped from the whole text at the end.
+        if (typeof event.delta === "string" && event.delta) onTextDelta?.(event.delta.replace(CITATION_CHARACTERS, ""));
+      } else if (type === "response.reasoning_summary_text.delta" ||
+        type === "response.reasoning_summary.delta" ||
+        type === "response.reasoning_summary_part.delta") {
+        // Only the provider's user-facing summary; never raw reasoning text.
+        if (typeof event.delta === "string" && event.delta) emitReasoningSummary(event.delta);
+      } else if (type === "response.reasoning_summary_part.added") {
+        const part = isRecord(event.part) ? event.part : undefined;
+        const text = part && typeof part.text === "string" ? part.text : "";
+        if (text && !reasoningSummaryText) emitReasoningSummary(text);
+      } else if (type === "response.reasoning_summary_text.done") {
+        const text = typeof event.text === "string" ? event.text : "";
+        if (text && !reasoningSummaryText) emitReasoningSummary(text);
+      } else if (type === "response.output_item.done") {
+        if (isRecord(event.item)) {
+          if (event.item.type === "reasoning" && Array.isArray(event.item.summary)) {
+            const summary = event.item.summary
+              .filter(isRecord)
+              .map((part) => typeof part.text === "string" ? part.text : "")
+              .join("");
+            if (summary && !reasoningSummaryText) emitReasoningSummary(summary);
+          }
+          const index = event.output_index;
+          const key = typeof index === "number" || typeof index === "string" ? index
+            : typeof event.item.id === "string" ? event.item.id : items.size;
+          items.set(key, event.item);
+        }
+      } else if (type === "response.completed") {
+        completed = isRecord(event.response) ? event.response : {};
+      } else if (type === "response.incomplete") {
+        completed = { ...(isRecord(event.response) ? event.response : {}), status: "incomplete" };
+      } else if (type === "response.failed") {
+        completed = isRecord(event.response) ? event.response : {};
+        if (Array.isArray(completed.output) && completed.output.some(item => isRecord(item) && item.type === "mcp_call")) {
+          serverTool = true;
+          onServerTool?.();
+        }
+        const error = isRecord(event.response) && isRecord(event.response.error) ? event.response.error : {};
+        failure = {
+          message: typeof error.message === "string" ? error.message : "Response failed.",
+          code: typeof error.code === "string" ? error.code : undefined,
+        };
+      } else if (type === "error" && typeof event.message === "string") {
+        failure = { message: event.message, code: typeof event.code === "string" ? event.code : undefined };
+      }
+    },
+    finish: () => {
+      if (failure) return { failure };
+      if (!completed) return {};
+      return { data: { ...completed, output: items.size > 0 ? Array.from(items.values()) : completed.output ?? [] } };
+    },
+    serverTool: () => serverTool,
+    remoteFailure: (message, code) => ({ ...completed, status: "failed", mcpEffectsPossible: true, error: { message, code },
+      output: Array.isArray(completed?.output) && completed.output.length ? completed.output : [...items.values()] }),
+  };
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" ? value : 0;
+}
