@@ -267,6 +267,43 @@ test('Commands act on the chat view as soon as its UI is mounted, not after a fi
   assert.equal(chat.shown[0].text, 'Tell me about Plan.md');
 });
 
+test('Chat opens in a main-area tab and reuses it beside the sidebar view', async () => {
+  const { plugin, view, app } = await chatSetup('anthropic');
+  plugin.isProviderConfigured = () => true;
+  const root = {}, sidebar = {};
+  app.workspace.rootSplit = root;
+  const sidebarLeaf = { view, getRoot: () => sidebar };
+  const tabLeaf = {
+    view: null,
+    getRoot: () => root,
+    async setViewState(state) { this.state = state; this.view = tabView; },
+  };
+  const tabView = new api.ObsidianChatView(tabLeaf, plugin);
+  tabView.chatContainer = fakeChat();
+  tabView.markReady();
+  view.markReady();
+  const revealed = [];
+  let created = 0;
+  app.workspace.revealLeaf = async leaf => { revealed.push(leaf); };
+  app.workspace.getLeaf = kind => {
+    assert.equal(kind, 'tab');
+    created++;
+    return tabLeaf;
+  };
+  app.workspace.getLeavesOfType = () => [sidebarLeaf];
+
+  assert.equal(await plugin.openChatTab(), tabView);
+  assert.equal(created, 1);
+  assert.deepEqual(tabLeaf.state, { type: 'stark-view', active: true });
+  assert.deepEqual(revealed, [tabLeaf]);
+
+  app.workspace.getLeavesOfType = () => [sidebarLeaf, tabLeaf];
+  assert.equal(await plugin.openChatTab(), tabView);
+  assert.equal(created, 1);
+  assert.equal(await plugin.openChat(), view);
+  assert.deepEqual(revealed, [tabLeaf, tabLeaf, sidebarLeaf]);
+});
+
 test('A view whose UI fails to mount is still ready, so commands waiting for it go on; sending only shows a notice', async () => {
   const { plugin } = await chatSetup('anthropic');
   const view = new api.ObsidianChatView({}, plugin);

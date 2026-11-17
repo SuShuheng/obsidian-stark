@@ -222,7 +222,7 @@ test('A request that fails in the background is sent again when Obsidian is back
   assert.ok(chat.thinkingLabels.includes('Resuming…'));
 });
 
-test('A turn resumes at most twice; then the error shows as usual', async () => {
+test('A turn resumes at most five times; then the error shows as usual', async () => {
   const { view, chat } = await chatSetup('anthropic');
   const requests = fakeFetch(() => {
     appLifecycle.markHidden();
@@ -234,8 +234,8 @@ test('A turn resumes at most twice; then the error shows as usual', async () => 
   } finally {
     off();
   }
-  assert.equal(requests.length, 3);
-  assert.equal(chat.thinkingLabels.filter(label => label === 'Resuming…').length, 2);
+  assert.equal(requests.length, 6);
+  assert.equal(chat.thinkingLabels.filter(label => label === 'Resuming…').length, 5);
   assert.deepEqual(shown(chat), [['user', 'Question'], ['error', 'Load failed']]);
 });
 
@@ -256,15 +256,62 @@ test('An error that would come again (a refused key) is not sent again after the
   assert.match(shown(chat).at(-1)[1], /invalid x-api-key/);
 });
 
-test('A request failing while Obsidian is in the foreground errors as before, without resuming', async () => {
+test('A network failure in the foreground is retried five times before its error', async () => {
   const { view, chat } = await chatSetup('anthropic');
   let fetches = 0;
   globalThis.__fetch = async () => { fetches++; throw new TypeError('Failed to fetch'); };
   transport(() => { throw new Error('offline'); });
   await view.handleUserMessage('Question', null);
-  assert.equal(fetches, 1);
+  assert.equal(fetches, 6);
   assert.deepEqual(shown(chat), [['user', 'Question'], ['error', 'offline']]);
   assert.equal(chat.thinkingLabels.includes('Resuming…'), false);
+});
+
+test('ChatGPT OAuth retries a transport failure five times before showing it', async () => {
+  api.setChatGPTOAuthService({ getUsableCredential: async () => ({ accessToken: 'fake-token', accountId: 'fake-account' }) });
+  const { view, chat } = await chatSetup('chatgpt-oauth');
+  let fetches = 0;
+  globalThis.__fetch = async () => { fetches++; throw new TypeError('Failed to fetch'); };
+  transport(() => { throw new Error('offline'); });
+  await view.handleUserMessage('Question', null);
+  assert.equal(fetches, 6);
+  assert.deepEqual(shown(chat), [
+    ['user', 'Question'],
+    ['error', 'ChatGPT OAuth request failed (): offline'],
+  ]);
+});
+
+test('ChatGPT OAuth does not apply network retries to a 400 response', async () => {
+  api.setChatGPTOAuthService({ getUsableCredential: async () => ({ accessToken: 'fake-token', accountId: 'fake-account' }) });
+  const { view, chat } = await chatSetup('chatgpt-oauth');
+  let fetches = 0;
+  globalThis.__fetch = async (url) => {
+    if (url === 'https://chatgpt.com/backend-api/codex/responses') fetches++;
+    return new Response(JSON.stringify({ detail: 'Bad Request' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  transport(() => assert.fail('requestUrl must not retry the refused request'));
+  await view.handleUserMessage('Question', null);
+  // One compatibility retry may drop an unsupported request option; it must
+  // never turn into the five-attempt recovery used for a dropped connection.
+  assert.ok(fetches <= 2, `expected at most 2 requests, got ${fetches}`);
+  assert.match(shown(chat).at(-1)[1], /^ChatGPT OAuth request failed \(400\): Bad Request/);
+});
+
+test('A provider 400 bad request is reported at once, never retried', async () => {
+  const { view, chat } = await chatSetup('anthropic');
+  let requests = 0;
+  globalThis.__fetch = async () => {
+    requests++;
+    return new Response(JSON.stringify({
+      error: { type: 'invalid_request_error', message: 'Bad Request' },
+    }), { status: 400, headers: { 'content-type': 'application/json' } });
+  };
+  await view.handleUserMessage('Question', null);
+  assert.equal(requests, 1);
+  assert.deepEqual(shown(chat), [['user', 'Question'], ['error', 'Anthropic API error (400): Bad Request']]);
 });
 
 test('A fetch failing in the background neither falls back to requestUrl nor marks the URL fetch-blocked', async () => {

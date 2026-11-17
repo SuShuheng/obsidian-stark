@@ -4,7 +4,7 @@ Stark 是一个面向 Obsidian 的跨平台智能体助手：通过 ChatGPT 账�
 搜索、编辑和创建笔记，并在对话中展示模型调用工具的执行过程。它基于
 [Chatting with AI](https://github.com/o1xhack/obsidian-chatting) 的 MIT 许可代码独立维护。
 
-当前公开预览版本为 **1.0.0**：
+当前正式版本为 **1.0.1**：
 
 - 插件 ID：`stark`
 - 插件名称：`Stark`
@@ -25,6 +25,8 @@ Stark 是一个面向 Obsidian 的跨平台智能体助手：通过 ChatGPT 账�
 - 桌面端流式请求支持系统代理、手动 HTTP 代理和直连；移动端使用 Obsidian/设备的系统网络，不提供手动代理覆盖。
 - 连续工具调用会收拢为一条活动摘要；运行中显示当前动作与参数，完成后按“命令、搜索、读取、编辑”等类别聚合，并可展开查看详情。
 - 语音模式支持按住说话和免手持模式；麦克风关闭时显示带红色斜杠的麦克风图标。
+- 网络断流或临时连接失败最多自动重试 5 次；HTTP 400 等不可恢复错误会立即停止，避免无效重试。
+- 聊天既可在右侧栏打开，也可通过命令或页面菜单在主编辑区的新标签页打开；两种视图会复用同一个聊天状态。
 
 产品记录见 [docs/DESIGN.md](docs/DESIGN.md)。
 
@@ -40,7 +42,7 @@ Stark 是一个面向 Obsidian 的跨平台智能体助手：通过 ChatGPT 账�
    SuShuheng/obsidian-stark
    ```
 
-4. 在 BRAT 设置中启用 **Enable pre-releases**，安装 `1.0.0` 预览版。
+4. 安装 `1.0.1` 正式版（BRAT 默认即可显示正式 Release）。
 5. 在 Obsidian 的“社区插件”中启用 **Stark**。
 
 ### 手动安装
@@ -58,7 +60,7 @@ Stark 是一个面向 Obsidian 的跨平台智能体助手：通过 ChatGPT 账�
 ```
 
 重启 Obsidian，并在“社区插件”中启用 **Stark**。也可以直接下载
-`stark-1.0.0.zip`，解压后放入同一目录。
+`stark-1.0.1.zip`，解压后放入同一目录。
 
 ## 首次使用
 
@@ -195,10 +197,10 @@ npm run build
 main.js
 manifest.json
 styles.css
-stark-1.0.0.zip
+stark-1.0.1.zip
 ```
 
-GitHub Release 使用与 `manifest.json` 相同的版本号标签（本版本为 `1.0.0`）。
+GitHub Release 使用与 `manifest.json` 相同的版本号标签（本版本为 `1.0.1`）。
 BRAT 读取这些资产安装插件；预览版需要在 BRAT 中启用 pre-releases。
 
 ## 安全约定

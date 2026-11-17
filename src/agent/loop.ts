@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { sendMessage } from "../api/client";
 import { ProviderError, StreamCutError } from "../api/errors";
+import { ChatGPTOAuthError } from "../auth/chatgptOAuth";
 import { isBuffered, lastChunkAt } from "../api/stream";
 import { clearOpenAIState } from "../api/openai";
 import { chatgptCompacts, chatgptReplayIdentity, clearChatGPTOAuthState } from "../api/chatgpt-oauth";
@@ -70,7 +71,7 @@ function displayServerCalls(calls: ServerToolCall[], callbacks: AgentCallbacks):
 /** Sending a request again (a cut-off stream, back from the background); tests shorten the wait. */
 export const RESUME = {
   /** Requests sent again per turn at most; after that the error shows. */
-  perTurn: 2,
+  perTurn: 5,
   /**
    * Back in the foreground, an open request is given up after this long
    * (ms) without data, counted from the return or its last data.
@@ -96,6 +97,21 @@ function transient(e: unknown): boolean {
   if (["insufficient_quota", "usage_limit_reached", "usage_not_included"].includes(e.code ?? "")) return false;
   if (e.remoteEffectsPossible) return false;
   return e.status === 0 || e.status === 408 || e.status === 429 || e.status >= 500;
+}
+
+/** A dropped connection or temporary transport failure, not a refused 4xx. */
+function connectionFailure(e: unknown): boolean {
+  if (e instanceof RequestBudgetError) return false;
+  if (e instanceof StreamCutError) return !e.sideEffects;
+  if (e instanceof ChatGPTOAuthError) {
+    // Network failures are wrapped here by the ChatGPT transport; sign-in and
+    // account errors are not temporary and must not be retried.
+    return /^ChatGPT OAuth request failed \((?:0|)\):/.test(e.message);
+  }
+  if (e instanceof ProviderError) {
+    return !e.remoteEffectsPossible && (e.status === 0 || e.status === 408 || e.status >= 500);
+  }
+  return true;
 }
 
 /**
@@ -882,7 +898,8 @@ ${mentioned.text}` : buildContextMessage(context);
           // refused as too large, or a provider's 4xx answer other than 408/429).
           const background = transient(e) && appLifecycle.hiddenSince(startedAt);
           const cut = e instanceof StreamCutError && !e.sideEffects;
-          if (resends < RESUME.perTurn && (cut || background) && !(e instanceof StreamCutError && e.sideEffects) &&
+          if (resends < RESUME.perTurn && (cut || background || connectionFailure(e)) &&
+              !(e instanceof StreamCutError && e.sideEffects) &&
               !(e instanceof ProviderError && e.remoteEffectsPossible)) {
 
             resends++;

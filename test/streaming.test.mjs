@@ -207,7 +207,7 @@ test('An incomplete stream is an error, not a partial answer', async () => {
 });
 
 for (const provider of ['anthropic', 'openai', 'chatgpt-oauth']) {
-  test(`${provider}: a cut-off stream is sent again, at most twice per turn`, async () => {
+  test(`${provider}: a cut-off stream is sent again, at most five times per turn`, async () => {
     const { app } = vaultApp();
     const whole = streamEvents(provider, [text('All good.')]);
     const cut = whole.slice(0, whole.findIndex(event => event.type === 'response.completed' || event.type === 'message_stop'));
@@ -223,12 +223,12 @@ for (const provider of ['anthropic', 'openai', 'chatgpt-oauth']) {
     assert.deepEqual(cb.errors, []);
     assert.deepEqual(cb.texts, ['All good.']);
 
-    // Cut every time: two resends, then the error.
+    // Cut every time: five resends, then the error.
     requests = 0;
     fakeFetch(() => { requests++; return streamedResponse(sseText(cut)); });
     const failing = callbacks();
     await new api.AgentLoop(app, settings(provider)).run('Hi', failing);
-    assert.equal(requests, 3);
+    assert.equal(requests, 6);
     assert.match(failing.errors[0], /ended before the answer was complete/);
   });
 }

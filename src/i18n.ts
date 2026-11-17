@@ -269,6 +269,7 @@ const ZH: Record<string, string> = {
   "New chat": "新聊天",
   "Open {name}": "打开 {name}",
   "Open chat": "打开聊天",
+  "Open chat in a new tab": "在新标签页打开聊天",
   "Chat about active note": "围绕当前笔记聊天",
   "Chat about this note": "围绕此笔记聊天",
   "Send selection to chat": "将所选内容发送到聊天",

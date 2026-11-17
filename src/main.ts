@@ -7,6 +7,7 @@ import {
   TFile,
   type TAbstractFile,
   type App,
+  type WorkspaceLeaf,
 } from "obsidian";
 import type { ChatSettings, SelectionScope, ChatHistoryEntry, ConversationSummary, UnifiedMessage, ModelPickerState } from "./types";
 import { DEFAULT_SETTINGS, DEFAULT_PROVIDER_MODELS } from "./types";
@@ -132,7 +133,9 @@ export default class ChatPlugin extends Plugin {
     if (!agent) {
       agent = new AgentLoop(this.app, this.settings, () => {
         if (this.unloaded || !this.conversations.includes(conversation)) return;
-        if (conversation.id === this.activeConversationId) this.getChatView()?.updateUsage();
+        if (conversation.id === this.activeConversationId) {
+          for (const view of this.getChatViews()) view.updateUsage();
+        }
         void this.saveChatHistory();
       }, conversation.id);
       // Also forgets OpenAI's response to chain to: it belongs to another conversation.
@@ -190,6 +193,9 @@ export default class ChatPlugin extends Plugin {
           item.setTitle(this.t("Open chat")).setIcon("message-circle").onClick(() => void this.openChat())
         );
         menu.addItem((item) =>
+          item.setTitle(this.t("Open chat in a new tab")).setIcon("panel-top").onClick(() => void this.openChatTab())
+        );
+        menu.addItem((item) =>
           item.setTitle(this.t("New chat")).setIcon("square-pen").onClick(() => void this.newChat())
         );
         menu.addItem((item) =>
@@ -210,6 +216,12 @@ export default class ChatPlugin extends Plugin {
       id: "open-chat",
       name: this.t("Open chat"),
       callback: () => void this.openChat(),
+    });
+
+    this.addCommand({
+      id: "open-chat-tab",
+      name: this.t("Open chat in a new tab"),
+      callback: () => void this.openChatTab(),
     });
 
     this.addCommand({
@@ -318,7 +330,7 @@ export default class ChatPlugin extends Plugin {
 
   onunload(): void {
     this.chatgptOAuth?.cancelBrowserLogin();
-    this.getChatView()?.endVoice();
+    for (const view of this.getChatViews()) view.endVoice();
     for (const agent of this.agents.values()) agent.abort();
     screenAwake.reset();
     // The tab that showed the AI's edits closes with the plugin (and Obsidian).
@@ -337,7 +349,7 @@ export default class ChatPlugin extends Plugin {
 
   /** Show or hide the chat's voice button (the voice route's sign-in changed). */
   updateVoiceAvailable(): void {
-    this.getChatView()?.updateVoiceAvailable();
+    for (const view of this.getChatViews()) view.updateVoiceAvailable();
   }
 
   // ─── Chat operations ────────────────────────────────────────────────
@@ -365,6 +377,15 @@ export default class ChatPlugin extends Plugin {
       return null;
     }
     return this.activateView();
+  }
+
+  /** Open the chat in the main editor area, reusing its chat tab when present. */
+  private async openChatTab(): Promise<ObsidianChatView | null> {
+    if (!this.isProviderConfigured()) {
+      new Notice(this.notConfiguredMessage());
+      return null;
+    }
+    return this.activateView(true);
   }
 
   /** Opens the chat on a new conversation. */
@@ -404,16 +425,21 @@ export default class ChatPlugin extends Plugin {
    * Open or reveal the chat view in the right sidebar (both desktop and
    * mobile); resolves with the view once its UI is mounted.
    */
-  private async activateView(): Promise<ObsidianChatView | null> {
+  private async activateView(mainTab = false): Promise<ObsidianChatView | null> {
     const { workspace } = this.app;
-    let leaf = workspace.getLeavesOfType(VIEW_TYPE_CHAT)[0];
+    const leaves = workspace.getLeavesOfType(VIEW_TYPE_CHAT);
+    let leaf = leaves.find((item) => this.isMainAreaLeaf(item) === mainTab);
     if (!leaf) {
-      // Right sidebar on both desktop and mobile.
-      // On mobile, this slides in as a panel from the right edge.
-      const right = workspace.getRightLeaf(false);
-      if (!right) return null;
-      await right.setViewState({ type: VIEW_TYPE_CHAT, active: true });
-      leaf = right;
+      if (mainTab) {
+        leaf = workspace.getLeaf("tab");
+      } else {
+        // Right sidebar on both desktop and mobile.
+        // On mobile, this slides in as a panel from the right edge.
+        const right = workspace.getRightLeaf(false);
+        if (!right) return null;
+        leaf = right;
+      }
+      await leaf.setViewState({ type: VIEW_TYPE_CHAT, active: true });
     }
     // Also loads a deferred view (Obsidian 1.7.2+).
     await workspace.revealLeaf(leaf);
@@ -422,15 +448,24 @@ export default class ChatPlugin extends Plugin {
     return leaf.view;
   }
 
+  private isMainAreaLeaf(leaf: WorkspaceLeaf): boolean {
+    const root = leaf.getRoot?.();
+    return !!root && root === this.app.workspace.rootSplit;
+  }
+
+  /** Every open chat view, with the active one first when it is a chat. */
+  private getChatViews(): ObsidianChatView[] {
+    const active = this.app.workspace.activeLeaf?.view;
+    const views = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHAT)
+      .map((leaf) => leaf.view)
+      .filter((view): view is ObsidianChatView => view instanceof ObsidianChatView);
+    if (!(active instanceof ObsidianChatView)) return views;
+    return [active, ...views.filter((view) => view !== active)];
+  }
+
   /** Get the active ObsidianChatView using proper instanceof check (deferred view safe) */
   private getChatView(): ObsidianChatView | null {
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHAT);
-    for (const leaf of leaves) {
-      if (leaf.view instanceof ObsidianChatView) {
-        return leaf.view;
-      }
-    }
-    return null;
+    return this.getChatViews()[0] ?? null;
   }
 
   /** Copy the conversation's API history as Markdown (for debugging); works with the chat panel closed. */
@@ -613,7 +648,9 @@ export default class ChatPlugin extends Plugin {
     if (total > MAX_HISTORY_ATTACHMENT_BYTES) unchanged.clear();
     const bounded = boundConversationAttachments(this.conversations, this.activeConversationId, undefined, unchanged);
     for (const id of bounded.changed) this.agents.get(id)?.invalidateHistoryCursor();
-    if (bounded.changed.has(this.activeConversationId)) this.getChatView()?.refreshAttachmentData();
+    if (bounded.changed.has(this.activeConversationId)) {
+      for (const view of this.getChatViews()) view.refreshAttachmentData();
+    }
     if (bounded.omitted) new Notice("Older attachment data was removed from chat history to stay within the shared 32 MiB budget. File names and conversation text are kept; reattach a file to use it again.");
   }
 
@@ -1131,12 +1168,13 @@ export default class ChatPlugin extends Plugin {
 
     // Update the chat view header with the new model name and thinking level
     this.refreshModelHeader();
-    const view = this.getChatView();
-    view?.updateEnterSends();
-    view?.updateFollowEdits();
-    view?.updateVoiceAvailable();
-    view?.updateLanguage(this.currentLanguage());
-    view?.updateUsage();
+    for (const view of this.getChatViews()) {
+      view.updateEnterSends();
+      view.updateFollowEdits();
+      view.updateVoiceAvailable();
+      view.updateLanguage(this.currentLanguage());
+      view.updateUsage();
+    }
   }
 
   /** Resolved UI language (automatic follows Obsidian). */
@@ -1208,7 +1246,8 @@ export default class ChatPlugin extends Plugin {
 
   /** Refresh catalog-derived display metadata without rewriting settings or secrets. */
   refreshModelHeader(): void {
-    this.getChatView()?.updateModel(this.modelHeaderLabel());
+    const label = this.modelHeaderLabel();
+    for (const view of this.getChatViews()) view.updateModel(label);
   }
 
   /** Copy `debug.log` to the clipboard (the "Debug log" setting writes it). */

@@ -50,11 +50,13 @@ test('restoring a cached provider catalog updates the header without a request o
     plugin.chatgptOAuth = { getCredential: () => ({ accountId: secret }) };
     let header;
     let saves = 0;
-    plugin.getChatView = () => ({ updateModel: label => { header = label; } });
+    const view = { updateModel: label => { header = label; } };
+    plugin.getChatView = () => view;
+    plugin.getChatViews = () => [view];
     plugin.saveSettings = async () => { saves++; };
     globalThis.__providerRequest = async () => { throw new Error('a fresh cache must not request models'); };
     api.clearCatalogModels(provider);
-    plugin.getChatView().updateModel(plugin.modelHeaderLabel());
+    view.updateModel(plugin.modelHeaderLabel());
     assert.notEqual(header, 'Cached QA model · high');
     const tab = new api.ChatSettingTab({}, plugin);
     tab.refreshSettingsTab = () => {};

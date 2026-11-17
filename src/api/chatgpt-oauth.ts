@@ -305,7 +305,7 @@ function httpError(response: StreamResult): Error {
   // The Codex backend names a plan's usage limit in `error.type` (also a 429).
   const code = getNestedString(json, ["error", "code"]) ?? getNestedString(json, ["error", "type"]);
   return new ProviderError(
-    `ChatGPT OAuth request failed (${response.status}): ${apiMsg}. The Codex backend may not accept the selected model or request format. Try reconnecting, picking a different model, or switching to OpenAI API Key.`,
+    `ChatGPT OAuth request failed (${response.status}): ${apiMsg}. The Codex backend may not accept the selected model or request format. Try reconnecting or selecting another enabled model.`,
     response.status, code, response.retryAfterMs,
   );
 }
