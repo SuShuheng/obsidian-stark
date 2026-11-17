@@ -32,7 +32,7 @@ Stark 是一个面向 Obsidian 的跨平台智能体助手：通过 ChatGPT 账�
 
 ## 安装
 
-### 通过 BRAT 安装预览版
+### 通过 BRAT 安装
 
 1. 在 Obsidian 中安装并启用 **BRAT**。
 2. 打开 BRAT，选择 **Add Beta plugin**。
