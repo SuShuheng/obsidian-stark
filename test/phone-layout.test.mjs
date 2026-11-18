@@ -1,6 +1,7 @@
 // The chat view on phones: it lifts itself by the part of the view the
 // on-screen keyboard covers (Obsidian doesn't shrink the sidebar for it).
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test, afterEach } from 'node:test';
 import { api } from './harness.mjs';
 
@@ -84,4 +85,14 @@ test('Desktop and tablets: nothing is measured', () => {
   const { observers, props } = phoneView({ height: 800, keyboard: 300, viewBottom: 760 });
   assert.equal(observers.length, 0);
   assert.deepEqual(props, {});
+});
+
+test('Phone main-area tabs reserve Obsidian floating navigation height', () => {
+  const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
+  assert.match(css,
+    /\.is-phone\.is-floating-nav \.mod-root \.workspace-leaf-content\[data-type="stark-view"\] \.view-content/);
+  assert.match(css,
+    /\.is-phone\.auto-full-screen \.mod-root \.workspace-leaf-content\[data-type="stark-view"\] \.view-content/);
+  assert.match(css, /--view-bottom-spacing/);
+  assert.match(css, /padding-bottom:\s*max\(/);
 });

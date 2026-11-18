@@ -1,7 +1,7 @@
 {
   "id": "stark",
   "name": "Stark",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minAppVersion": "1.11.4",
   "description": "Cross-platform agentic AI assistant for Obsidian that reads, edits, and creates notes through ChatGPT account sign-in.",
   "author": "GuoFan Zhang",

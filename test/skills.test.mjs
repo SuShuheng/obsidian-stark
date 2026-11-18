@@ -83,6 +83,75 @@ function hiddenSkillsApp() {
   };
 }
 
+// Mobile: hidden `.agents/skills` is not exposed, but a visible mirror is.
+function mirroredSkillsApp() {
+  const root = 'Stark Skills';
+  const folder = new api.TFolder(root);
+  const skillFolder = new api.TFolder(`${root}/mobile-skill`);
+  const text = '---\nname: mobile-skill\ndescription: Use the visible mobile mirror.\n---\n\nDo the mobile task.';
+  const file = Object.assign(new api.TFile(`${skillFolder.path}/SKILL.md`), { parent: skillFolder });
+  const notes = Object.assign(new api.TFile(`${skillFolder.path}/notes.md`), { parent: skillFolder });
+  folder.children.push(skillFolder);
+  skillFolder.children.push(file, notes);
+  const files = new Map([[file.path, file], [notes.path, notes]]);
+  const texts = new Map([[file.path, text], [notes.path, 'Mobile notes']]);
+  return {
+    vault: {
+      getFolderByPath: path => path === root ? folder : path === skillFolder.path ? skillFolder : null,
+      getFileByPath: path => files.get(path) ?? null,
+      cachedRead: async found => texts.get(found.path) ?? '',
+    },
+    metadataCache: {
+      getFileCache: found => found.path === file.path
+        ? { frontmatter: { name: 'mobile-skill', description: 'Use the visible mobile mirror.' }, frontmatterPosition: { end: { offset: text.indexOf('\n\nDo') } } }
+        : null,
+    },
+  };
+}
+
+// A hidden source that can be mirrored into a visible mobile folder.
+function mirrorSourceApp() {
+  const root = '.agents/skills';
+  const skill = `${root}/source-command-su`;
+  const examples = `${skill}/examples`;
+  const files = new Map([
+    [`${skill}/SKILL.md`, '---\nname: source-command-su\ndescription: Update the resource index\n---\n\nDo the update.'],
+    [`${skill}/notes.md`, 'Resource notes'],
+    [`${examples}/one.md`, 'Example'],
+  ]);
+  const folders = new Set([root, skill, examples]);
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const adapter = {
+    async list(path) {
+      if (path === root) return { files: [], folders: [skill] };
+      if (path === skill) return { files: [`${skill}/SKILL.md`, `${skill}/notes.md`], folders: [examples] };
+      if (path === examples) return { files: [`${examples}/one.md`], folders: [] };
+      return { files: [], folders: [] };
+    },
+    async exists(path) { return files.has(path) || folders.has(path); },
+    async read(path) { return files.get(path); },
+    async readBinary(path) { return encoder.encode(files.get(path)).buffer; },
+    async writeBinary(path, data) {
+      files.set(path, decoder.decode(new Uint8Array(data)));
+      const parent = path.slice(0, path.lastIndexOf('/'));
+      if (parent) folders.add(parent);
+    },
+    async mkdir(path) { folders.add(path); },
+  };
+  return {
+    app: {
+      vault: {
+        getFolderByPath: () => null,
+        getFileByPath: () => null,
+        adapter,
+      },
+      metadataCache: { getFileCache: () => null },
+    },
+    files,
+  };
+}
+
 const systemText = body => typeof body.system === 'string' ? body.system : body.system.map(block => block.text).join('');
 const resultText = block => typeof block.content === 'string' ? block.content : block.content.map(c => c.text ?? '').join('');
 
@@ -164,6 +233,47 @@ test('Hidden .agents/skills is scanned through the Vault adapter and loaded by u
   assert.match(loaded.result, /^<skill name="source-command-su"/);
   assert.match(loaded.result, /Do the update\./);
   assert.match(loaded.result, /notes\.md/);
+});
+
+test('Mobile: hidden .agents/skills falls back to the visible Stark Skills mirror', async () => {
+  const app = mirroredSkillsApp();
+  assert.equal(skills.MOBILE_SKILLS_FOLDER, 'Stark Skills');
+  assert.deepEqual(skills.allSkills(app, '.agents/skills').map(skill => skill.path), [
+    'Stark Skills/mobile-skill/SKILL.md',
+  ]);
+  const found = await skills.refreshSkills(app, '.agents/skills');
+  assert.deepEqual(found, [{
+    name: 'mobile-skill',
+    description: 'Use the visible mobile mirror.',
+    path: 'Stark Skills/mobile-skill/SKILL.md',
+  }]);
+  const loaded = await skills.useSkill(app, '.agents/skills', { name: 'mobile-skill' });
+  assert.equal(loaded.isError, false);
+  assert.match(loaded.result, /Do the mobile task\./);
+  assert.match(loaded.result, /Stark Skills\/mobile-skill\/notes\.md/);
+});
+
+test('Desktop can mirror hidden .agents/skills into the visible mobile folder', async () => {
+  const { app, files } = mirrorSourceApp();
+  assert.equal(await skills.mirrorSkillsForMobile(app, '.agents/skills'), 1);
+  assert.equal(files.get('Stark Skills/source-command-su/SKILL.md'),
+    '---\nname: source-command-su\ndescription: Update the resource index\n---\n\nDo the update.');
+  assert.equal(files.get('Stark Skills/source-command-su/notes.md'), 'Resource notes');
+  assert.equal(files.get('Stark Skills/source-command-su/examples/one.md'), 'Example');
+});
+
+test('Desktop scans automatically copy hidden skills into the mobile-visible folder', async () => {
+  const previous = globalThis.__isDesktopApp;
+  globalThis.__isDesktopApp = true;
+  try {
+    const { app, files } = mirrorSourceApp();
+    const found = await skills.refreshSkills(app, '.agents/skills');
+    assert.equal(found[0].name, 'source-command-su');
+    assert.equal(files.get('Stark Skills/source-command-su/SKILL.md'),
+      '---\nname: source-command-su\ndescription: Update the resource index\n---\n\nDo the update.');
+  } finally {
+    globalThis.__isDesktopApp = previous;
+  }
 });
 
 test('/name: invoked at the start or after a space, loaded along with the message', async () => {
@@ -308,6 +418,11 @@ test('Settings (Obsidian 1.13+): the skills folder, a list of its skills each op
   assert.equal(plugin.saves, 2);
   folder.blur();
   assert.equal(redraws.count, 1);
+
+  const mirror = row();
+  definitions.find(d => d.name === 'Mobile Skills mirror').render(mirror);
+  assert.match(mirror.desc, /Stark Skills/);
+  assert.equal(mirror.buttons[0].text, 'Sync for mobile');
 
   const notes = row();
   definitions.find(d => d.name === '/meeting-notes').render(notes);

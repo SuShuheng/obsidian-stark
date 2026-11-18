@@ -49,6 +49,27 @@ body:not(.is-mobile) .mod-left-split .workspace-leaf-content[data-type="stark-vi
   transition: padding-bottom 150ms ease-out;
 }
 
+/* In a main-area tab Obsidian's floating navigation is fixed over the
+   bottom of the view instead of sitting in a drawer. Keep the composer
+   above it using Obsidian's own reserved height (navbar + safe area, minus
+   the keyboard). This also covers auto-full-screen, where the same navbar
+   overlays the tab. Tablets and the right sidebar keep their existing
+   spacing. */
+.is-phone.is-floating-nav .mod-root .workspace-leaf-content[data-type="stark-view"] .view-content,
+.is-phone.auto-full-screen .mod-root .workspace-leaf-content[data-type="stark-view"] .view-content {
+  padding-bottom: max(
+    calc(
+      var(
+        --view-bottom-spacing,
+        calc(var(--safe-area-inset-bottom, 0px) + var(--navbar-height, 64px))
+      ) + var(--size-4-2)
+    ),
+    var(--ochatting-lift, 0px),
+    var(--size-4-4)
+  );
+  transition: padding-bottom 150ms ease-out;
+}
+
 /* A line under the input row separates it from the tab menu below. */
 .is-phone .workspace-drawer .workspace-leaf-content[data-type="stark-view"] .ochatting-container {
   border-bottom: 1px solid var(--background-modifier-border);

@@ -133,6 +133,7 @@ test('Settings expose the eight focused pages and only the ChatGPT account path'
   ]);
   const names = tab.getAllSettingDefinitions().map(item => item.name);
   assert.ok(names.includes('ChatGPT account'));
+  assert.ok(names.includes('Default chat location'));
   assert.ok(!names.includes('Provider'));
   assert.ok(!names.includes('API key'));
   assert.ok(!names.includes('MCP servers'));
@@ -140,6 +141,20 @@ test('Settings expose the eight focused pages and only the ChatGPT account path'
   const chat = pages.find(page => page.name === 'Chat');
   assert.ok(chat.items.some(item => item.name === 'Compaction point'));
   assert.ok(!chat.items.some(item => item.name === 'Saved chats'));
+});
+
+test('Default chat location switches between the right sidebar and a main editor tab', async () => {
+  const { plugin, render } = settingsTab();
+  const location = render('Default chat location');
+  const dropdown = location.dropdowns[0];
+  assert.deepEqual(dropdown.options, [['sidebar', 'Right sidebar'], ['tab', 'Main editor tab']]);
+  assert.equal(dropdown.value, 'sidebar');
+  await dropdown.change('tab');
+  assert.equal(plugin.settings.chatOpenLocation, 'tab');
+  assert.equal(plugin.saves, 1);
+  await dropdown.change('sidebar');
+  assert.equal(plugin.settings.chatOpenLocation, 'sidebar');
+  assert.equal(plugin.saves, 2);
 });
 
 test('Models page lists only the API catalog, with current-model protection and context restore', async () => {

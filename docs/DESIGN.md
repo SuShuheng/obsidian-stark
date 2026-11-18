@@ -7,7 +7,7 @@
 
 实现验证：
 
-- `npm test`: 1017 项，1016 项通过（当前 Windows 环境未安装 OpenSSL，TLS 运行时证书测试跳过 1 项）
+- `npm test`: 1022 项，1021 项通过（当前 Windows 环境未安装 OpenSSL，TLS 运行时证书测试跳过 1 项）
 - `npm run typecheck`: 通过
 - `npm run svelte-check`: 0 错误、0 警告
 - `npm run build`: 通过
@@ -16,7 +16,7 @@
 ## 已验证基线
 
 - 来源版本：Chatting with AI `0.12.0`
-- 当前 Stark 版本：`1.0.1`
+- 当前 Stark 版本：`1.0.2`
 - 基线能力：代理式聊天、笔记与 Canvas 操作、Skills、MCP、聊天历史、撤销、语音、ChatGPT/OpenAI/Anthropic 连接
 - 插件身份已隔离：`stark` / `stark-view` / Stark SecretStorage 前缀
 
@@ -167,6 +167,9 @@ interface SkillPreference {
 
 - 默认目录改为 Vault 根目录下的 `.agents/skills`；每个子目录包含一个
   `SKILL.md`。
+- 移动端适配器或 Obsidian Sync 可能无法读取隐藏的 `.agents/skills`。Stark
+  会回退到可见的 `Stark Skills` 镜像；桌面端扫描 Skills 时自动把当前技能
+  文件夹及资源复制到该镜像，“代理”页的“同步到移动端”可手动强制刷新。
 - 设置页可修改目录、立即重新扫描、打开技能、创建新技能，并逐个启用/停用。
 - 只有启用的技能会出现在系统提示、`/` 候选和 `use_skill` 结果中。
 - 如果旧配置仍指向默认的 `Skills` 目录：`.agents/skills` 存在时迁移到新目录；
@@ -236,6 +239,35 @@ HTTP 400 不进入网络重试循环。
 
 验收：桌面端可同时保留侧栏与主区域聊天；重复执行“新标签页”命令不会创建第二个
 主区域聊天标签页，命令更新会同步到所有已打开的聊天视图。
+
+## V1.0.2：聊天入口与移动端 Skills
+
+### 默认聊天打开位置
+
+- “常规”页新增“默认聊天打开位置”，可选择右侧栏或主编辑区标签页。
+- 功能区图标、通用“打开聊天”命令和新聊天等入口遵循该设置。
+- 命令面板和功能区右键菜单继续提供独立的“在侧边栏打开聊天”和
+  “在新标签页打开聊天”入口，不受默认设置影响。
+- 主区域与侧栏通过 Workspace 父级链区分；不能只比较 `getRoot()`，因为两者都
+  属于同一个 `WorkspaceRoot`。
+- 新建主区域标签页后先调用 `setViewState`；若 Obsidian 仍保留空白标签页，
+  则通过 `leaf.open()` 挂载真实聊天视图并记录失败原因。
+
+### 移动端 Skills
+
+- Obsidian 移动端或 Obsidian Sync 无法读取隐藏的 `.agents/skills` 时，Stark
+  自动回退到 Vault 根目录下可见的 `Stark Skills` 镜像。
+- 桌面端扫描 Skills 时自动维护该镜像；“代理”页提供“同步到移动端”按钮。
+- 镜像会保留技能目录内的 SKILL.md、说明和嵌套资源文件。
+
+### 手机底部导航栏
+
+- 手机主区域标签页读取 Obsidian 的 `--view-bottom-spacing`，为悬浮导航栏和
+  安全区预留底部空间；较旧版本使用导航栏高度加安全区的回退值。
+- 右侧抽屉继续使用原有 24px 间距和键盘抬升逻辑，不重复增加留白。
+
+验收：桌面端可切换默认聊天入口并复用主区域标签页；手机上主区域聊天输入框
+位于悬浮导航栏上方；移动端可读取 `Stark Skills` 中的技能及资源。
 
 ## 设计记录模板
 

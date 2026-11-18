@@ -5,7 +5,17 @@ import type { BrowserLogin } from "./auth/chatgptBrowserLogin";
 import type { ChatGPTDeviceAuthorization, PollHandle } from "./auth/chatgptOAuth";
 import { clearDebugLog } from "./debug";
 import { INSTRUCTIONS_FILE } from "./agent/instructions";
-import { allSkills, DEFAULT_SKILLS_FOLDER, refreshSkills, SKILL_FILE, SKILL_TEMPLATE, skillEnabled, type Skill } from "./agent/skills";
+import {
+  allSkills,
+  DEFAULT_SKILLS_FOLDER,
+  mirrorSkillsForMobile,
+  MOBILE_SKILLS_FOLDER,
+  refreshSkills,
+  SKILL_FILE,
+  SKILL_TEMPLATE,
+  skillEnabled,
+  type Skill,
+} from "./agent/skills";
 import { validServerName, validServerUrl } from "./api/mcp";
 import { DEFAULT_COMPACT_PERCENT, MIN_COMPACT_PERCENT, compactThreshold, defaultCompactThreshold } from "./agent/compaction";
 import { formatTokens } from "./agent/usage";
@@ -126,6 +136,7 @@ export class ChatSettingTab extends PluginSettingTab {
         name: this.t("General"),
         items: [
           { name: this.t("Plugin language"), render: setting => this.renderLanguage(setting) },
+          { name: this.t("Default chat location"), aliases: ["Sidebar", "Tab", "Layout"], render: setting => this.renderChatOpenLocation(setting) },
           { name: this.t("ChatGPT account"), render: setting => this.renderChatGPTOAuthSection(setting.settingEl.parentElement!, setting) },
           { name: this.t("Network and streaming"), render: setting => this.renderNetworkInfo(setting) },
         ],
@@ -166,6 +177,7 @@ export class ChatSettingTab extends PluginSettingTab {
           { name: this.t("Default tool permission"), render: setting => this.renderDefaultToolPermission(setting) },
           { type: "group", heading: this.t("Tools"), items: this.toolPreferenceItems() },
           { name: this.t("Skills folder"), aliases: ["Skill", "SKILL.md", ".agents/skills"], render: setting => this.renderSkillsFolder(setting) },
+          { name: this.t("Mobile Skills mirror"), aliases: ["Skill", "Mobile", ".agents/skills"], render: setting => this.renderMobileSkillsMirror(setting) },
           ...this.skillPreferenceItems(),
           { name: this.t("New skill"), render: setting => this.renderNewSkill(setting, allSkills(this.app, this.plugin.settings.skillsFolder).length === 0) },
         ],
@@ -322,6 +334,23 @@ export class ChatSettingTab extends PluginSettingTab {
       );
   }
 
+  private renderChatOpenLocation(setting: Setting): void {
+    const s = this.plugin.settings;
+    setting
+      .setName(this.t("Default chat location"))
+      .setDesc(this.t("Choose where the ribbon and Open chat command show Stark. The explicit sidebar and new-tab commands remain available."))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("sidebar", this.t("Right sidebar"))
+          .addOption("tab", this.t("Main editor tab"))
+          .setValue(s.chatOpenLocation === "tab" ? "tab" : "sidebar")
+          .onChange(async (value) => {
+            s.chatOpenLocation = value === "tab" ? "tab" : "sidebar";
+            await this.plugin.saveSettings();
+          })
+      );
+  }
+
   private renderWebSearch(setting: Setting): void {
     const s = this.plugin.settings;
     setting
@@ -416,6 +445,36 @@ export class ChatSettingTab extends PluginSettingTab {
         const found = allSkills(this.app, s.skillsFolder).length;
         new Notice(this.t("Found {count} skills.", { count: found }));
       }));
+  }
+
+  /**
+   * Dot folders are hidden from Obsidian's mobile adapter and are not copied
+   * by Obsidian Sync. A visible mirror gives mobile the same skills.
+   */
+  private renderMobileSkillsMirror(setting: Setting): void {
+    const s = this.plugin.settings;
+    setting
+      .setName(this.t("Mobile Skills mirror"))
+      .setDesc(this.t("Obsidian mobile cannot reliably read hidden folders such as .agents/skills. Stark falls back to the visible {folder} folder; sync the current skills there before using them on mobile.", {
+        folder: MOBILE_SKILLS_FOLDER,
+      }))
+      .addButton((button) => button
+        .setButtonText(this.t("Sync for mobile"))
+        .onClick(async () => {
+          try {
+            const count = await mirrorSkillsForMobile(this.app, s.skillsFolder);
+            await refreshSkills(this.app, s.skillsFolder).catch(() => undefined);
+            new Notice(count
+              ? this.t("Copied {count} skills to {folder}.", { count, folder: MOBILE_SKILLS_FOLDER })
+              : this.t("No skills found in {folder}.", { folder: s.skillsFolder }));
+            this.refreshSettingsTab();
+          } catch (error) {
+            new Notice(this.t("Could not copy skills to {folder}: {error}", {
+              folder: MOBILE_SKILLS_FOLDER,
+              error: error instanceof Error ? error.message : String(error),
+            }));
+          }
+        }));
   }
 
   private skillPreferenceItems(): SettingDefinition[] {

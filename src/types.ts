@@ -78,6 +78,8 @@ export interface ChatSettings {
   voiceMicMode: VoiceMicMode;
   /** UI language; automatic follows Obsidian. */
   language: LanguagePreference;
+  /** Where the ribbon and the Open chat command show the chat. */
+  chatOpenLocation?: "sidebar" | "tab";
   modelCatalog?: import("./api/model-catalog").CatalogState;
 }
 
@@ -160,6 +162,7 @@ export const DEFAULT_SETTINGS: ChatSettings = {
   voice: "cove",
   voiceMicMode: "hands-free",
   language: "auto",
+  chatOpenLocation: "sidebar",
 };
 
 // ─── Unified Message Format ─────────────────────────────────────────────────

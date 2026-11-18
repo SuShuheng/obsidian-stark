@@ -267,20 +267,28 @@ test('Commands act on the chat view as soon as its UI is mounted, not after a fi
   assert.equal(chat.shown[0].text, 'Tell me about Plan.md');
 });
 
-test('Chat opens in a main-area tab and reuses it beside the sidebar view', async () => {
+test('Chat opens in a real main-area tab, reuses it, and honors the default location', async () => {
   const { plugin, view, app } = await chatSetup('anthropic');
   plugin.isProviderConfigured = () => true;
-  const root = {}, sidebar = {};
+  const root = {}, left = {}, right = {}, sidebarTabs = { parent: right }, mainTabs = { parent: root };
   app.workspace.rootSplit = root;
-  const sidebarLeaf = { view, getRoot: () => sidebar };
+  app.workspace.leftSplit = left;
+  app.workspace.rightSplit = right;
+  const sidebarLeaf = { view, parent: sidebarTabs, getRoot: () => root };
   const tabLeaf = {
     view: null,
+    parent: mainTabs,
     getRoot: () => root,
-    async setViewState(state) { this.state = state; this.view = tabView; },
+    // Some Obsidian versions leave a freshly created tab blank after
+    // setViewState; the plugin must then open the concrete view itself.
+    async setViewState(state) { this.state = state; },
+    async open(candidate) {
+      this.view = candidate;
+      candidate.chatContainer = fakeChat();
+      candidate.markReady();
+      return candidate;
+    },
   };
-  const tabView = new api.ObsidianChatView(tabLeaf, plugin);
-  tabView.chatContainer = fakeChat();
-  tabView.markReady();
   view.markReady();
   const revealed = [];
   let created = 0;
@@ -292,7 +300,9 @@ test('Chat opens in a main-area tab and reuses it beside the sidebar view', asyn
   };
   app.workspace.getLeavesOfType = () => [sidebarLeaf];
 
-  assert.equal(await plugin.openChatTab(), tabView);
+  const tabView = await plugin.openChatTab();
+  assert.ok(tabView instanceof api.ObsidianChatView);
+  assert.equal(tabLeaf.view, tabView);
   assert.equal(created, 1);
   assert.deepEqual(tabLeaf.state, { type: 'stark-view', active: true });
   assert.deepEqual(revealed, [tabLeaf]);
@@ -300,8 +310,10 @@ test('Chat opens in a main-area tab and reuses it beside the sidebar view', asyn
   app.workspace.getLeavesOfType = () => [sidebarLeaf, tabLeaf];
   assert.equal(await plugin.openChatTab(), tabView);
   assert.equal(created, 1);
-  assert.equal(await plugin.openChat(), view);
-  assert.deepEqual(revealed, [tabLeaf, tabLeaf, sidebarLeaf]);
+  plugin.settings.chatOpenLocation = 'tab';
+  assert.equal(await plugin.openChat(), tabView);
+  assert.equal(await plugin.openChatSidebar(), view);
+  assert.deepEqual(revealed, [tabLeaf, tabLeaf, tabLeaf, sidebarLeaf]);
 });
 
 test('A view whose UI fails to mount is still ready, so commands waiting for it go on; sending only shows a notice', async () => {

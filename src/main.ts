@@ -7,6 +7,7 @@ import {
   TFile,
   type TAbstractFile,
   type App,
+  type WorkspaceItem,
   type WorkspaceLeaf,
 } from "obsidian";
 import type { ChatSettings, SelectionScope, ChatHistoryEntry, ConversationSummary, UnifiedMessage, ModelPickerState } from "./types";
@@ -190,7 +191,7 @@ export default class ChatPlugin extends Plugin {
         // Right-click: show menu with options
         const menu = new Menu();
         menu.addItem((item) =>
-          item.setTitle(this.t("Open chat")).setIcon("message-circle").onClick(() => void this.openChat())
+          item.setTitle(this.t("Open chat in the sidebar")).setIcon("sidebar-right").onClick(() => void this.openChatSidebar())
         );
         menu.addItem((item) =>
           item.setTitle(this.t("Open chat in a new tab")).setIcon("panel-top").onClick(() => void this.openChatTab())
@@ -216,6 +217,12 @@ export default class ChatPlugin extends Plugin {
       id: "open-chat",
       name: this.t("Open chat"),
       callback: () => void this.openChat(),
+    });
+
+    this.addCommand({
+      id: "open-chat-sidebar",
+      name: this.t("Open chat in the sidebar"),
+      callback: () => void this.openChatSidebar(),
     });
 
     this.addCommand({
@@ -376,7 +383,16 @@ export default class ChatPlugin extends Plugin {
       new Notice(this.notConfiguredMessage());
       return null;
     }
-    return this.activateView();
+    return this.activateView(this.settings.chatOpenLocation === "tab");
+  }
+
+  /** Open the chat in the right sidebar, regardless of the default location. */
+  private async openChatSidebar(): Promise<ObsidianChatView | null> {
+    if (!this.isProviderConfigured()) {
+      new Notice(this.notConfiguredMessage());
+      return null;
+    }
+    return this.activateView(false);
   }
 
   /** Open the chat in the main editor area, reusing its chat tab when present. */
@@ -439,7 +455,7 @@ export default class ChatPlugin extends Plugin {
         if (!right) return null;
         leaf = right;
       }
-      await leaf.setViewState({ type: VIEW_TYPE_CHAT, active: true });
+      await this.mountChatView(leaf);
     }
     // Also loads a deferred view (Obsidian 1.7.2+).
     await workspace.revealLeaf(leaf);
@@ -448,9 +464,39 @@ export default class ChatPlugin extends Plugin {
     return leaf.view;
   }
 
+  /**
+   * Registering a view normally restores it through setViewState. A freshly
+   * created blank tab can remain empty on some Obsidian versions, so open the
+   * concrete view as a fallback before revealing the leaf.
+   */
+  private async mountChatView(leaf: WorkspaceLeaf): Promise<void> {
+    try {
+      await leaf.setViewState({ type: VIEW_TYPE_CHAT, active: true });
+    } catch (error) {
+      debugLog(this.app, "CHAT_VIEW_SET_STATE_FAILED", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (leaf.view instanceof ObsidianChatView) return;
+    try {
+      await leaf.open(new ObsidianChatView(leaf, this));
+    } catch (error) {
+      debugLog(this.app, "CHAT_VIEW_OPEN_FAILED", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      new Notice(this.t("Could not open the Stark chat view."));
+    }
+  }
+
   private isMainAreaLeaf(leaf: WorkspaceLeaf): boolean {
-    const root = leaf.getRoot?.();
-    return !!root && root === this.app.workspace.rootSplit;
+    const { workspace } = this.app;
+    let item: WorkspaceItem | null = leaf;
+    while (item) {
+      if (item === workspace.leftSplit || item === workspace.rightSplit) return false;
+      if (item === workspace.rootSplit) return true;
+      item = item.parent ?? null;
+    }
+    return false;
   }
 
   /** Every open chat view, with the active one first when it is a chat. */
@@ -1653,6 +1699,9 @@ function normalizeSettings(value: unknown): Partial<ChatSettings> {
   if (typeof value.voice === "string" && VOICES.includes(value.voice)) settings.voice = value.voice;
   if (value.voiceMicMode === "hands-free" || value.voiceMicMode === "hold") settings.voiceMicMode = value.voiceMicMode;
   if (value.language === "auto" || value.language === "zh" || value.language === "en") settings.language = value.language;
+  if (value.chatOpenLocation === "sidebar" || value.chatOpenLocation === "tab") {
+    settings.chatOpenLocation = value.chatOpenLocation;
+  }
   settings.modelCatalog = normalizeCatalogState(value.modelCatalog);
   // Older releases stored a token count. Convert it once the saved catalog
   // can name the model's window; otherwise the new percentage falls back to

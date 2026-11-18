@@ -1,4 +1,14 @@
-import { App, TFile, TFolder, getFrontMatterInfo, normalizePath, prepareFuzzySearch } from "obsidian";
+import {
+  App,
+  TFile,
+  TFolder,
+  getFrontMatterInfo,
+  normalizePath,
+  Platform,
+  prepareFuzzySearch,
+  type DataAdapter,
+  type ListedFiles,
+} from "obsidian";
 import type { ToolResult, MentionContext, SkillPreference } from "../types";
 
 /**
@@ -12,6 +22,8 @@ import type { ToolResult, MentionContext, SkillPreference } from "../types";
 
 export const SKILL_FILE = "SKILL.md";
 export const DEFAULT_SKILLS_FOLDER = ".agents/skills";
+/** A visible copy for mobile, whose adapters and Obsidian Sync may not expose dot folders. */
+export const MOBILE_SKILLS_FOLDER = "Stark Skills";
 /** Characters of a SKILL.md given to the model (as for AGENTS.md). */
 export const SKILL_CHARS = 32768;
 /** A skill's other files listed at most. */
@@ -71,11 +83,9 @@ function frontMatterValues(text: string): Record<string, string> {
   return values;
 }
 
-/** Every skill in `folder`: each subfolder with a SKILL.md, by name. */
-export function allSkills(app: App, folder: string): Skill[] {
-  const key = skillsFolder(folder);
+function visibleSkills(app: App, key: string): Skill[] {
   const root = app.vault.getFolderByPath(key);
-  if (!(root instanceof TFolder)) return hiddenSkillsFor(app).get(key) ?? [];
+  if (!(root instanceof TFolder)) return [];
   const skills: Skill[] = [];
   for (const child of root.children) {
     if (!(child instanceof TFolder)) continue;
@@ -89,44 +99,118 @@ export function allSkills(app: App, folder: string): Skill[] {
     // The folder's name when the file has none, as Claude Code does.
     skills.push({ name: value("name") || child.name, description: value("description"), path: file.path });
   }
-  const sorted = skills.sort((a, b) => a.name.localeCompare(b.name));
+  return skills.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function rememberSkills(app: App, key: string, skills: Skill[]): Skill[] {
+  const sorted = [...skills].sort((a, b) => a.name.localeCompare(b.name));
   hiddenSkillsFor(app).set(key, sorted);
   return sorted;
 }
 
-/** Scan the live Vault index, then the adapter for hidden folders such as `.agents/skills`. */
-export async function refreshSkills(app: App, folder: string): Promise<Skill[]> {
-  const key = skillsFolder(folder);
-  const root = app.vault.getFolderByPath(key);
-  const visible = allSkills(app, key);
-  if (root instanceof TFolder && visible.length) return visible;
-  const adapter = app.vault.adapter;
-  if (!adapter?.list) return visible;
-  let listing: { files: string[]; folders: string[] };
-  try {
-    listing = await adapter.list(key);
-  } catch {
-    return visible;
-  }
-  const skills: Skill[] = [];
-  for (const directory of listing.folders) {
-    const path = `${directory}/${SKILL_FILE}`;
+function cleanAdapterPath(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+async function listAdapterFolder(adapter: DataAdapter, path: string): Promise<ListedFiles> {
+  const clean = cleanAdapterPath(normalizePath(path));
+  const candidates = [...new Set([clean, `/${clean}`].filter(Boolean))];
+  let empty: ListedFiles = { files: [], folders: [] };
+  for (const candidate of candidates) {
     try {
-      if (!(await adapter.exists(path))) continue;
-      const text = await adapter.read(path);
-      const properties = frontMatterValues(text);
-      skills.push({
-        name: properties.name?.trim() || directory.split("/").pop() || directory,
-        description: properties.description?.trim() || "",
-        path,
-      });
+      const listing = await adapter.list(candidate);
+      if (listing.files.length || listing.folders.length) return listing;
+      empty = listing;
     } catch {
-      // A removed or unreadable skill doesn't hide the others.
+      // Some mobile adapters reject a style of path; try the next one.
     }
   }
-  const sorted = skills.sort((a, b) => a.name.localeCompare(b.name));
-  hiddenSkillsFor(app).set(key, sorted);
-  return sorted;
+  return empty;
+}
+
+function normalizedListedPath(root: string, path: string): string {
+  const clean = cleanAdapterPath(normalizePath(path));
+  if (clean === root || clean.startsWith(`${root}/`)) return clean;
+  return normalizePath(`${root}/${clean}`);
+}
+
+/**
+ * Hidden `.agents/skills` is absent from Obsidian's Vault index. On mobile it
+ * can also be absent from Obsidian Sync, so a visible `Stark Skills` copy is
+ * used as a fallback when it exists.
+ */
+async function adapterSkills(app: App, key: string): Promise<Skill[]> {
+  const adapter = app.vault.adapter;
+  if (!adapter?.list) return [];
+  const listing = await listAdapterFolder(adapter, key);
+  const directories = new Set<string>();
+  for (const folder of listing.folders) directories.add(normalizedListedPath(key, folder));
+  for (const file of listing.files) {
+    const clean = cleanAdapterPath(normalizePath(file));
+    if (clean.split("/").pop()?.toLocaleLowerCase() !== SKILL_FILE.toLocaleLowerCase()) continue;
+    directories.add(skillFolder(clean));
+  }
+  const normalizedSkills: Skill[] = [];
+  for (const directory of directories) {
+    try {
+      const details = await listAdapterFolder(adapter, directory);
+      const listed = details.files.find((file) =>
+        file.split("/").pop()?.toLocaleLowerCase() === SKILL_FILE.toLocaleLowerCase());
+      if (!listed) continue;
+      const skillFile = normalizedListedPath(directory, listed);
+      const text = await adapter.read(skillFile);
+      const properties = frontMatterValues(text);
+      normalizedSkills.push({
+        name: properties.name?.trim() || directory.split("/").pop() || directory,
+        description: properties.description?.trim() || "",
+        path: normalizePath(skillFile),
+      });
+    } catch {
+      // A removed or unreadable directory doesn't hide the others.
+    }
+  }
+  return normalizedSkills;
+}
+
+/** Every skill in `folder`: the scan cache, the Vault index, then the mobile mirror. */
+export function allSkills(app: App, folder: string): Skill[] {
+  const key = skillsFolder(folder);
+  const cached = hiddenSkillsFor(app).get(key);
+  if (cached) return cached;
+  const visible = visibleSkills(app, key);
+  if (visible.length || app.vault.getFolderByPath(key) instanceof TFolder) {
+    return rememberSkills(app, key, visible);
+  }
+  if (key !== MOBILE_SKILLS_FOLDER) {
+    const mirrored = visibleSkills(app, MOBILE_SKILLS_FOLDER);
+    if (mirrored.length) return rememberSkills(app, key, mirrored);
+  }
+  return [];
+}
+
+/** Scan the live Vault index, hidden adapters, and the mobile-visible mirror. */
+export async function refreshSkills(app: App, folder: string): Promise<Skill[]> {
+  const key = skillsFolder(folder);
+  const candidates = key === MOBILE_SKILLS_FOLDER ? [key] : [key, MOBILE_SKILLS_FOLDER];
+  for (const candidate of candidates) {
+    const visible = visibleSkills(app, candidate);
+    if (visible.length) {
+      const found = rememberSkills(app, key, visible);
+      if (Platform.isDesktopApp && key !== MOBILE_SKILLS_FOLDER) {
+        await copySkillsToMobile(app, found).catch(() => undefined);
+      }
+      return found;
+    }
+    const hidden = await adapterSkills(app, candidate);
+    if (hidden.length) {
+      const found = rememberSkills(app, key, hidden);
+      if (Platform.isDesktopApp && key !== MOBILE_SKILLS_FOLDER) {
+        await copySkillsToMobile(app, found).catch(() => undefined);
+      }
+      return found;
+    }
+  }
+  return rememberSkills(app, key, []);
 }
 
 /** A skill is enabled unless its SKILL.md path was explicitly disabled. */
@@ -196,10 +280,67 @@ function filesIn(folder: TFolder): string[] {
 
 async function filesInAdapter(app: App, folder: string): Promise<string[]> {
   if (!folder) return [];
-  const listing = await app.vault.adapter.list(folder);
-  const files = [...listing.files];
-  for (const child of listing.folders) files.push(...await filesInAdapter(app, child));
+  const listing = await listAdapterFolder(app.vault.adapter, folder);
+  const files = listing.files.map((file) => normalizedListedPath(folder, file));
+  for (const child of listing.folders) {
+    files.push(...await filesInAdapter(app, normalizedListedPath(folder, child)));
+  }
   return files.sort();
+}
+
+async function ensureAdapterFolder(adapter: DataAdapter, path: string): Promise<void> {
+  const clean = cleanAdapterPath(normalizePath(path));
+  if (!clean || await adapter.exists(clean)) return;
+  const parent = skillFolder(clean);
+  if (parent) await ensureAdapterFolder(adapter, parent);
+  await adapter.mkdir(clean);
+}
+
+function sameBytes(left: ArrayBuffer, right: ArrayBuffer): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  const a = new Uint8Array(left);
+  const b = new Uint8Array(right);
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+async function copySkillsToMobile(app: App, skills: Skill[]): Promise<number> {
+  const adapter = app.vault.adapter;
+  let copied = 0;
+  for (const skill of skills) {
+    const from = skillFolder(skill.path);
+    const name = from.split("/").pop() || skill.name;
+    const to = normalizePath(`${MOBILE_SKILLS_FOLDER}/${name}`);
+    if (from === to) continue;
+    const sourceFolder = app.vault.getFolderByPath(from);
+    const sourceFiles = sourceFolder instanceof TFolder
+      ? filesIn(sourceFolder)
+      : await filesInAdapter(app, from);
+    for (const file of sourceFiles) {
+      const relative = file.slice(from.length + 1);
+      if (!relative) continue;
+      const target = normalizePath(`${to}/${relative}`);
+      await ensureAdapterFolder(adapter, skillFolder(target));
+      const data = await adapter.readBinary(file);
+      const existing = await adapter.exists(target)
+        ? await adapter.readBinary(target).catch(() => undefined)
+        : undefined;
+      if (!existing || !sameBytes(existing, data)) await adapter.writeBinary(target, data);
+    }
+    copied++;
+  }
+  return copied;
+}
+
+/**
+ * Copy the current skills to the visible mobile folder. Obsidian Sync doesn't
+ * sync hidden dot folders, and some mobile adapters don't expose them.
+ */
+export async function mirrorSkillsForMobile(app: App, folder: string): Promise<number> {
+  const source = skillsFolder(folder);
+  if (source === MOBILE_SKILLS_FOLDER) return 0;
+  await refreshSkills(app, source);
+  return copySkillsToMobile(app, allSkills(app, source));
 }
 
 /** `use_skill`: the named skill's instructions and files; an error lists the skills there are. */
